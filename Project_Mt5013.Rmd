@@ -1,0 +1,598 @@
+---
+title: "Interconnectedness of company boards"
+author: "Jacob Westlund"
+output:
+  html_document:
+    df_print: paged
+    code_folding: show
+---
+```{r global_options, include=FALSE}
+# Set global options
+knitr::opts_chunk$set(warning=FALSE, message=FALSE, fig.width=10, fig.height = 7, fig.align='center')
+```
+
+In this project for class MT5013 we are going to investigate the interconnectedness of companies listed on the Nasdaq OMX Stockholm Stock Exchange using the companies' board of directors and key excecutives. For simplification I will refer to all such people as board members. A company is connected to another if an individual is a member of both boards. The project is inspired by [this article](https://hbr.org/2016/04/how-corporate-boards-connect-in-charts) from Harvard Business Review which describes research of the interconnectedness of companies through company boards in differerent countries/regions.
+
+For data collection we will use a combination of webscraping and APIs. A list of the public companies can be found at the [Nasdaq OMX website](http://www.nasdaqomxnordic.com/aktier/listed-companies/stockholm), while information about the members of the board of directors for each company can be found on the [Thompson Reuters website](https://reuters.com) and using the same company's family of free APIs called [OpenPermID](https://permid.org/).Through OpenPermID, three different APIs are available, ```Entity Search```, ```Record Matching``` and ```Tagging```. We will primarly use the second one.
+
+### Load libraries
+
+We use several different libraries in this project. We begin by loading them all here.
+```{r}
+# General use
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(gtools)
+
+# Data collection
+library(rvest)
+library(httr)
+library(jsonlite)
+
+# For graphs
+library(tidygraph)
+library(ggraph)
+library(igraph)
+```
+
+
+
+### Functions {.tabset}
+
+To save on space and shorten the code chunks in the text, the code for the functions used throughout this project are listed below in the tabset. 
+
+#### URL list
+```{r}
+# Function for creating list of urls
+url_list <- function(url_vec, url_base, rm_space = TRUE) {
+  if (rm_space == TRUE) {
+    url_vec <- map(url_vec, function(i) str_replace_all(i, " ", "+"))
+  }
+  url_vec_concat <- map_chr(url_vec, function(i) paste0(url_base, i))
+}
+```
+
+#### Scrape URL
+```{r}
+# Function to scrape url
+scrape_url <- function(url, node, fun, ...) {
+  resp <- GET(url)
+  if (resp$status_code == 200) {
+    Sys.sleep(1)
+    html_content <- content(resp) %>%
+      try(html_node(node))
+    if (!(inherits(html_content, "try-error"))) {
+      result <- html_content %>% fun(url, ...)
+        }
+    result
+    }
+}
+```
+
+#### Scrape RIC table
+```{r}
+# Fucntion to find which row to collect RIC from
+scrape_ric <- function(x_content, url) {
+  ric_row <- html_table(x_content) %>% 
+        flatten_df() %>%
+        {.[str_which(.$Symbol, ".ST$")[1], ]} %>%
+        mutate(Url = url)
+}
+```
+
+#### Scrape board table
+```{r}
+# Function for choosing table of board members
+scrape_board_table <- function(x_content, url) {
+  b_table <- html_table(x_content) %>%
+    .[[1]] %>%
+    mutate(Url = url)
+} 
+```
+
+#### Record matching
+```{r record_match}
+# Record matching function
+record_match <- function(file, url_api, type, token, fun, ...) {
+  result <- POST(url_api,
+               body = list("file" = upload_file(file)),
+               add_headers(.headers = c("x-openmatch-dataType" = type,
+                         "X-AG-Access-Token" = token)))
+  Sys.sleep(2)
+  if (result$status_code != 200) {
+    status <- result$status_code
+    warning(glue("Something went wrong. Status: {status}"))
+  } else {
+    result_json <- content(result, "text")
+    matched <- fromJSON(result_json)$outputContentResponse
+  }
+  matched %>% fun(file, ...)
+}
+```
+
+#### Write matched companies
+```{r}
+# Snippet to write matched companies to csv
+snippet_comp_match <- function(matched, file) {
+  write_excel_csv(matched, "Data/CompaniesMatchResult.csv")
+}
+```
+
+#### Write matched boards
+```{r}
+# Snippet to write to matched board members to csv
+snippet_board_match <- function(matched, file) {
+  num <- str_extract(file, "[:digit:]+")
+  write_excel_csv(matched, paste0("Data/MatchBoard/CompaniesBoardMatchResult", num, ".csv"))
+}
+```
+
+#### Create edge list
+```{r}
+# Create edge list
+edge_list <- function(node_list) {
+  len_node <- length(node_list)
+  if (len_node > 1) {
+    edge_matrix <- combinations(len_node, 2, node_list)
+    t(apply(edge_matrix, 1, sort)) %>% as_tibble() # Sort individual rows
+  }
+  else {
+    tibble(V1 = character(), V2 = character())
+  }
+}
+```
+
+
+### Companies on the Stockholm Stock Exchange
+
+To start off the project we grab a list of the companies that we are investigating from the Nasdaq OMX website. The informtion is available either as an Excel-file or a html-table. For the sake of simpler automation we will use the html-table and save it as an .csv-file.
+
+```{r eval=FALSE}
+# Grab table of listed companies from Nasdaq and write table to CSV
+"http://www.nasdaqomxnordic.com/aktier/listed-companies/stockholm" %>% 
+  read_html() %>% 
+  html_node("table") %>% 
+  html_table() %>% 
+  select(-c(Currency, `Fact Sheet`)) %>% 
+  rowid_to_column("ID") %>%
+  write_excel_csv("Data/CompaniesListed.csv")
+```
+
+```{r echo=FALSE}
+# Create a table to describe the columns of the data frame for companies from the Stockholm Stock Exchange
+text_tbl <- data_frame(
+  Column = c("ID", "Name", "Symbol", "ISIN", "Sector","ICB Code"),
+  Description = c(
+    "Row ID which we added ourselves",
+    "Name of listed equity entity.",
+    "Ticker symbol for identifying listed equity entity on exchange.", 
+    "International Securities Identification Number. Alphanumeric code for identifying security globally.",
+    "Industry of company. Equivalent to the first digit of the ICB Code.",
+    "Industry Classification Benchmark code. Equivalent to the previous column but with one digit/level extra precision (supersector)."
+  )
+)
+
+kable(text_tbl, caption = "Listed companies variables") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, position = "float_right") %>%
+  column_spec(1, bold = TRUE, border_right = TRUE) %>%
+  column_spec(2, width = "40em")
+```
+
+Our saved file ```ListedCompanies.csv``` of companies contains five columns with name and description in accordance to the table on the right. We are primarly interested in the ```Symbol``` column which we will use to match our companies with companies at the Reuters website and OpenPermID APIs. Unfortunatley we can't use the ```ISIN``` column  as an identifier for our companies since Reuters does not use ISIN-codes for identification of securities. Instead of ISINs, Reuters uses its own propriatery system for security identification known as RICs (Reuters Identification Code). For permanent identfication of entities PermIDs are used, also a propriatery system.  The two sector columns ```Sector``` and ```ICB Code``` are also of interest since we can divide the companies into groups when we later explore the data.
+
+### Matching companies
+
+Once we have our list of companies, we need to match them with companies at Reuters and OpenPermID to later be able to extract data. My initial plan was to use the ```Record Matching``` API with the data we had already collected but the matching was not satisfactory when using the company ```Name``` and ```Symbol``` from ```ListedCompanies.csv``` as input. Instead we will collect the RICs and company names by scraping the Reuters website and then use the ```Record Matching``` API to match the companies. The first step is to generate a list of URLs to scrape.
+
+```{r eval = FALSE}
+# Create list of URLs to scrape
+companies_listed <- read_csv("Data/CompaniesListed.csv")
+url_base <- "https://www.reuters.com/finance/stocks/lookup?searchType=any&comSortBy=marketcap&sortBy=&dateRange=&search="
+url_companies <- url_list(companies_listed$Symbol, url_base)
+companies_listed <- companies_listed %>% select(-Symbol)
+```
+
+On each page visit, the data that we are interested in is found in a html-table. Since the results in the table are sorted, we simply save the first row where the RIC ends with ```.ST``` for the Stockholm Stock Exchange.
+
+```{r eval=FALSE}
+# Scrape reuters
+map_df(url_companies, function(x) scrape_url(url = x, node = ".search-table-data", fun = scrape_ric)) %>% 
+  bind_cols(companies_listed) %>%
+  select(ID, Company, Symbol, Exchange, Sector, Url) %>%
+  distinct(Company, .keep_all = TRUE) %>%
+  write_excel_csv("Data/CompaniesScraped.csv")
+```
+
+Once we have data on RICs and company names we can prepare a file that we will upload to the matching engine through the ```Record Matching``` API. The file is formated in accordance to the template that is available in the documentation of the API [here](https://developers.thomsonreuters.com/open-permid/open-permid-record-matching-restful-api/docs). We then upload the file to the API using our record_match function. The response is in the JSON-format and we simply save the data in the response as a csv-file. Before we save the file, we can quickly replace the incorrect matches that was found with the correct ones.
+
+```{r eval = FALSE}
+# Create csv-file for matching companies and retrieving PermIDs 
+companies_scraped <- read_csv("Data/CompaniesScraped.csv")
+
+template_listed_companies <- na.omit(companies_rics) %>%
+  mutate(LocalID = ID,
+         `Standard Identifier` = paste0("RIC:", Symbol),
+         Name = Company,
+         Country = "",
+         Street = "",
+         City = "",
+         PostalCode = "",
+         State = "",
+         Website = "") %>%
+  select(LocalID, `Standard Identifier`, Name, Country, Street, City, PostalCode, State, Website)
+
+write_excel_csv(template_listed_companies, "Data/CompaniesMatchUpload.csv")
+
+# Record matching of companies, POST file to API
+record_match(file = "Data/CompaniesMatchUpload.csv", 
+             url_api = "https://api.thomsonreuters.com/permid/match/file", 
+             type = "Organization", token = "key", 
+             fun =  snippet_comp_match)
+
+# Replace incorrect PermID-matches
+read_csv("Data/CompaniesMatchResult.csv") %>% mutate(`Match OpenPermID` = recode(`Match OpenPermID`, 
+                `https://permid.org/1-5038061248` = "https://permid.org/1-4295890065", 
+                `https://permid.org/1-4297005994` = "https://permid.org/1-5000722969",
+                `https://permid.org/1-429636874` = "https://permid.org/1-5046729192")) %>%
+  write_excel_csv("Data/CompaniesMatchResult.csv")
+```
+
+
+### Board members
+
+When I initially planned for the project I had hoped that we could use the ```Entity Search``` API to retrieve data on the board members of each company, after all the information is available through the UI for each PermID. Unfortunately the connection from company to person (entity search by company) is not yet available in the API. The opposite connection from person to company (entity search by person) is available but it is not useful for us. After e-mailing Reuters, I got the reply that the company to person connection would be inplace in the future but not at this moment. Since we need the data now we will instead scrape it from the Reuters website where it is also available. Again, we start by preparing a list of URLs and then extract the data we need from each page. The results are saved to a csv-file.
+
+```{r eval = FALSE}
+# Input file and url
+companies_matched <- read_csv("Data/CompaniesMatchResult.csv")
+url_base <- "https://www.reuters.com/finance/stocks/company-officers/"
+
+# Create URL list for company boards
+url_boardmembers <- companies_matched %>% 
+  distinct(`Match OpenPermID`, .keep_all = TRUE) %>% 
+  pull(`Input_Standard Identifier`) %>%
+  str_remove_all("RIC:") %>% 
+  url_list(url_base, rm_space = FALSE)
+
+# Scrape reuters
+map_df(url_boardmembers, function(x) scrape_url(url = x, node = ".dataTable", fun = possibly(scrape_board_table, NULL))) %>%
+  select(Name, Age, Since, `Current Position`, Url) %>% 
+  write_excel_csv("Data/CompaniesBoardScraped.csv")
+```
+
+To find out who is on each board we need a way to uniquely identify each board member. We could use the full name of each person as an identifier (it is of course not certainly unique) and it would probably work pretty well. However, a better option is to use the PermID for each person as a identifier. Once again we will use the ```Record Matching``` API to collect the PermIDs. As before we start by preparing a file in accordance to a template that is available in the documentation of the API.
+
+```{r eval = FALSE}
+# Input file and url
+boardmembers <- read_csv("Data/CompaniesBoardScarped.csv")
+url_base <- "https://www.reuters.com/finance/stocks/company-officers/"
+
+# Prepare file and save file
+template_boardmembers <- boardmembers %>% 
+  mutate(`Standard Identifier` = str_c("RIC:", str_remove_all(Url, url_base))) %>% 
+  left_join(companies_matched, by = c("Standard Identifier" = "Input_Standard Identifier")) %>%
+  mutate(LocalID = "",
+         FirstName = word(Name, 1, sep = "\\s"),
+         MiddleName = "",
+         PreferredName = "",
+         LastName = word(Name, -1, sep = "\\s"),
+         CompanyPermID = `Match OpenPermID`,
+         CompanyName = `Input_Name`,
+         NamePrefix = "",
+         NameSuffix = "") %>%
+  select(LocalID,FirstName,MiddleName,PreferredName,LastName,CompanyPermID,CompanyName,NamePrefix,NameSuffix)
+  
+write_excel_csv(template_boardmembers, "Data/CompaniesBoardMatchUpload.csv")
+```
+
+Since there is a upload limit of 1000 matches per API-call we need to split the file into smaller chunks. In this instance we choose to split the file into files with 500 rows each. We then upload the file through the API and save the responses as csv-files. We can then combine the smaller csv-files into one large file.
+
+```{r eval = FALSE}
+# Split file
+boardmembers_upload <- read_csv("Data/CompaniesBoardMatchUpload.csv")
+split_df <- split(boardmembers_upload, (seq(nrow(boardmembers_upload))-1) %/% 500)
+for(i in seq_along(split_df)) {
+    filename <- paste0("Data/UploadBoard/BoardPermID", i, ".csv")
+    write_excel_csv(split_df[[i]], filename, na = "")
+}
+
+# Input files
+folder <- "Data/UploadBoard/"
+filenames <- list.files(folder)
+
+# Record matching of board members
+for (i in seq_along(filenames)) {
+  record_match(file = paste0("Data/UploadBoard/", filenames[[i]]), 
+             url_api = "https://api.thomsonreuters.com/permid/match/file", 
+             type = "Person", token = "key", 
+             fun = snippet_board_match)
+}
+
+# Combine files
+folder <- "Data/MatchBoard/"
+filenames <- paste0(folder, list.files(folder))
+# Make sure that files are combined in the order that they were split
+ord <- map(filenames, function(x) as.numeric(str_extract_all(x, "\\d+"))) %>% unlist %>% order(unlist(filenames))
+filenames <- filenames[ord]
+map_df(filenames, read_csv) %>%
+  select(-c(ProcessingStatus, `Match Ordinal`, `Original Row Number`)) %>%
+  write_excel_csv("Data/CompaniesBoardMatchResult.csv")
+```
+
+## Creating node and edge lists
+
+We have now completed the data collection and can start to transform the data into a suitable format to do analysis and visualisation with graphs. To create the graphs I have chosen to use the ```tidygraph``` and ```ggraph``` packages. ```tidygraph``` is a fairly new package that is built on top of ```igraph``` which is perhaps the most widely used package in R for creating graphs. However the syntax and workflow of ```tidygraph``` is (as you probably guessed by the name) more similar to the rest of the offical tidyverse packages, where ```igraph``` differs quite a bit. Note, that we will also use ```igraph``` to compute basic characteristics about our graph.```ggraph``` on the other hand is an extension of the ```ggplot``` package and it is therefore easy to work with and to create beautiful graphs. I would have been fun to use a package such as ```d3``` to create interactive graphs but that will have to be saved for the next time.
+
+```tidygraph``` makes it possible to create graph objects in multiple ways and it accepts a wide range of formats as in-data. I decided to use a data frame with information about the nodes, a node list, and a different data frame with information about the edges, an edge list. We create the node list and the edge list from the company and board data that we have previously collected. 
+
+```{r}
+# Create node list
+# Join matched companies with scraped companies (contains sector for each company)
+# Join on Symbol (RIC)
+companies_matched <- read_csv("Data/CompaniesMatchResult.csv") %>% 
+  mutate(Symbol = str_sub(`Input_Standard Identifier`, 5))
+companies_scraped <- read.csv("Data/CompaniesScraped.csv") 
+inner_join(companies_matched, companies_scraped, by = "Symbol") %>% 
+  select(ID = `Match OpenPermID`, Label = Company, Symbol, Sector) %>% 
+  write_excel_csv("Data/NodeList.csv")
+
+# Filter out board members that were not matched or matched badly
+# before creating edge list
+final_board <- read_csv("Data/CompaniesBoardMatchResult.csv") %>%
+  #bind_cols(boardmembers) %>%
+  filter(`Match Score` > 0.2) %>%
+  mutate(OrgID = paste0("https://permid.org/", word(`Input_OrgOpenPermID`, -1, sep = "/")))
+
+# Create edge list
+final_board %>% select(ID = `Match OpenPermID` , OrgID) %>% 
+  arrange(ID, OrgID) %>% 
+  group_by(ID) %>% 
+  distinct(OrgID) %>% 
+  summarise(Org = list(OrgID)) %>% 
+  pull(Org) %>%
+  map_df(function(x) edge_list(x)) %>%
+  ungroup %>%
+  group_by(V1, V2) %>%
+  mutate(Weight = n()) %>% 
+  distinct() %>%
+  write_excel_csv("Data/EdgeList.csv")
+```
+
+```{r echo=FALSE}
+# Create a table to describe the columns of the data frame for the node list
+text_tbl_node <- data_frame(
+  Column = c("ID", "Label", "Symbol", "Sector"),
+  Description = c(
+    "PermID for identification of the equity entity. Used as an identifier for nodes in edges (edge list).",
+    "Name of listed equity entity (company).",
+    "RIC (Reuters Identification Code) symbol for identifying listed equity entity on the Reuters website. We use it a shortname", 
+    "Industry of company.")
+)
+
+kable(text_tbl_node, caption = "Node list variables") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, position = "float_left") %>%
+  column_spec(1, bold = TRUE, border_right = TRUE) %>%
+  column_spec(2, width = "30em")
+
+# Create a table to describe the columns of the data frame for the edge list
+text_tbl_edge <- data_frame(
+  Column = c("V1", "V2", "Weight"),
+  Description = c(
+    "Edge (vertex) with PermID as identifier.",
+    "Edge (vertex) with PermID as identifier.",
+    "Number of edges between V1 and V2.")
+)
+
+kable(text_tbl_edge, caption = "Edge list variables") %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, position = "right") %>%
+  column_spec(1, bold = TRUE, border_right = TRUE) %>%
+  column_spec(2, width = "20em")
+```
+<br \>
+<br \>
+<br \>
+<br \>
+
+The columns of our node list is described in the table to the left and the columns for the edge list is described in the table to the right.
+
+## Overview of company boards and companies interconnectedness
+
+We are now finally ready to have a look at our data and visualise it. We will start by exploring the people on the boards. What are their names and how many positions at different companies do they hold?
+
+```{r fig.width = 8, fig.height = 6}
+# Calculate how many people in our data set
+unique_people <- final_board %>% distinct(`Match OpenPermID`) %>% nrow()
+# Create graph for the most common names of board members
+final_board %>% distinct(`Match OpenPermID`, .keep_all = TRUE) %>%
+  group_by(`Match First Name`) %>% 
+  summarise(Number = n()) %>%
+  arrange(desc(Number)) %>%
+  head(20) %>%
+  ggplot(aes(x = reorder(`Match First Name`, Number), y = Number)) +
+    geom_point(col = "#eb1e2c", size = 5) +
+    geom_segment(aes(x = `Match First Name`, 
+                   xend = `Match First Name`, 
+                   y = min(Number), 
+                   yend = max(Number)), 
+               linetype = "dashed", 
+               size = 0.05) +
+    coord_flip() +
+    labs(title = "Most common first name of board members and key executives", y = NULL, x = NULL) +
+    theme_classic()
+    
+```
+
+So what does the company boards look like? Well out of the ```r unique_people``` people in our data set most appear to be men, 19 out of the 20 most common names in the graph above are male names. In particular they are common names for older to middle age men. The three most common names; Anders, Peter and Johan are all among the 10 most common names for men in Sweden according to [SCB](https://www.scb.se/hitta-statistik/sverige-i-siffror/namnsok/). The only female name to be found on the top 20 list in the graph, Anna, is the most common female name (and the most common name overall) in Sweden. 
+
+These results are perhaps somewhat expected and not that exciting. However, since 34 % of boardmembers and 23 % of top exceutives in our listed companies are female, according to [Allbright](http://www.allbright.se/s/Allbrightrapporten-2018_WEBB.pdf), one could have expected more names of the top 20 to be female names. Maybe it is the case that the females at the top of the companies tend to be a more diverse group of people, at least in terms of their names.
+
+```{r}
+# Distribution of number of positions held by people
+dist_final_board <- final_board %>% group_by(`Match OpenPermID`) %>% 
+  summarise(Positions = n())
+
+n_average_positions <- mean(dist_final_board$Positions) # Average number of positions per person
+n_median_positions <- median(dist_final_board$Positions) # Median number of positions per person
+n_more_positions <-  dist_final_board %>% filter(Positions > 1) %>% nrow() # Number of persons, more than one position
+  
+# Read node- and edge lists, and create graph object
+# Add several useful variables to graph object
+# Number of companies connected with company
+# Number of connetcion with other companies 
+# Logical vector if both companies in edge is from the same sector
+edges <- read_csv("Data/EdgeList.csv")
+nodes <- read_csv("Data/NodeList.csv")
+graph <- tbl_graph(nodes = nodes, edges = edges, directed = FALSE) %>% 
+  activate(edges) %>%
+  mutate(nodes_same_sector = ifelse(nodes[from,]$Sector == nodes[to,]$Sector, as.logical(1), as.logical(0))) %>%
+  activate(nodes) %>%
+  mutate(Degree = centrality_degree(), 
+         Degree_weighted = centrality_degree(weights = Weight))
+  
+
+# Get number companies
+# Get number of companies that are connected to at least on other company
+# Get number of components in graph
+# Calculate diameter of graph
+# Largest connected component
+n_nodes_total <- graph %>% activate(nodes) %>% as.tibble() %>% nrow() 
+n_nodes_connected <- graph %>% activate(nodes)  %>% filter(Degree != 0) %>% as.tibble() %>% nrow()
+n_components <- to_components(graph) %>% length()
+n_nodes_large_comp <- to_components(graph)[[1]] %>% activate(nodes) %>% as.tibble() %>% nrow()
+diam_graph <- diameter(graph)
+ 
+
+# Create table 
+dist_final_board %>% group_by(Positions) %>%
+  summarise(Count = n()) %>%
+  kable(caption = "Distribution of number of positions") %>%
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE, position = "left") %>%
+  column_spec(1, width = "15em", bold = TRUE, border_right = TRUE) %>%
+  column_spec(2, width = "15em")
+```
+
+<br \>
+Next we look at how many postions each person holds with a simple table. The distribution is heavily left skewed with the average person having a position at `r round(n_average_positions, 2)` companies, the median is of course `r round(n_median_positions, 1)`. Only `r n_more_positions` out of `r unique_people` persons, or `r round(100*n_more_positions/unique_people, 0)` %, hold more than one position. But at the same time, a company is connected to other companies more often than not, in fact `r n_nodes_connected` out of `r n_nodes_total` companies, that is `r round(100*n_nodes_connected/n_nodes_total, 0)` %, are connected to another company. We will next visualise the distribution of company connections per industry and in total.
+
+```{r}
+# Plot distribution of number of people connections to other companies
+# the distributions is divided per sector/industry
+nodes <- graph %>% activate(nodes) %>% as.tibble()
+nodes_no_sector <- graph %>% activate(nodes) %>% as.tibble() %>% select(-Sector)
+
+# Create means
+means_data = nodes  %>% group_by(Sector) %>%
+  summarise(mean_sector = mean(Degree_weighted))
+
+# Plot
+ggplot(nodes, aes(x = Degree_weighted, y = stat(count), colour = Sector, fill = Sector)) +
+  geom_density(data = nodes_no_sector, color = "transparent", fill = "grey", alpha = 0.4) +
+  geom_density() +
+  geom_vline(data = means_data, aes(xintercept = mean_sector), colour = "#eb1e2c", linetype = "dashed") +
+  geom_text(data = means_data, aes(label = round(mean_sector, 1), x = (mean_sector + 4), y = 18), 
+            colour = "#eb1e2c", hjust = 0) +
+  facet_wrap(~Sector, nrow = 2) +
+  labs(title = "Distribution of people connections to other companies", 
+       y = "count", x = "connections", subtitle = "Red line and number is sector mean") +
+  theme_minimal() +
+  theme(legend.position="none")
+```
+
+Again the distribution of connections is heavily left skewed, but not as much as we saw before. From the graphs it is difficult to draw any certain conclusions, if companies in certain sectors are connected to other companies more often then companies in other sectors, since some sectors contain very companies. However, it appears that companies in the sectors basic materials, consumer goods, financials and industrials are more often connected than companies in other large sectors such as technology, health care and consumer services.
+
+We can also look at the importance of companies in our network. The importance (centrality) of a node can be measured in a number of different ways, from just the degree of the node to more advanced algortihms such as pagerank, ```tidygraph``` implements over 20 different centrality algorithms. During my short time researching the subject I found out that it is not so clearcut which algorithm that is preferable in which situtation. I therefore chose to use a measure which was easily understood, betweeness. The betweeness of a node $v$ measures the sum of proportion of the shortest paths between two nodes that passes through $v$ and all shortest paths. To make the graphs look nicer we exclude all companies/nodes that are unconnected (degree = 0). 
+
+```{r}
+# Create graph over centrality
+graph %>% activate(nodes) %>%
+    mutate(Centrality = centrality_betweenness()) %>% 
+    filter(Degree != 0) %>%
+    ggraph(layout = "graphopt") + 
+    geom_edge_link(aes(), colour = "gray", alpha = 0.3) + 
+    geom_node_point(aes(size = Centrality, colour = Centrality), alpha = 0.5) + 
+    geom_node_text(aes(filter = Centrality > 2500, label = Label), repel = TRUE, colour = "black", size = 4) + 
+    scale_color_gradient(low = "yellow", high = "red", guide = 'legend') +
+    labs(title = "Centrality score of companies/nodes", subtitle = "Centrality is measured with betweenness") +
+    theme_graph()
+```
+
+The companies with the highest centrality scores (labeled) in our plot are interestingly not among the companies with the most connections (degree) to other companies but they have important connections for the network. The largest connected component contains `r n_nodes_large_comp` companies with a diameter (greatest shortest path) of `r diam_graph`. `r round(100*n_nodes_large_comp/n_nodes_connected , 0)` % of all connected companies are in some way directly or indirectly connected.
+
+Next we should look at if two companies within the same sector are more likely to be connected then two companies from different sectors. We make som new graphs.
+
+```{r}
+# Split graph into edges
+edges <- graph %>% activate(edges) %>% as.tibble()
+nodes <- graph %>% activate(nodes) %>% as.tibble() 
+
+# Create vector with weight of only edges with same sector nodes
+graph_same <- graph %>% activate(edges) %>% filter(nodes_same_sector == TRUE) %>% as.tibble() %>%
+  tbl_graph(nodes = nodes , directed = FALSE) %>%
+  mutate(node_degree = centrality_degree(weights = Weight))
+
+# Create graph with weights for only 
+graph_diff <- graph %>% activate(edges) %>% filter(nodes_same_sector == FALSE) %>% as.tibble() %>%
+  tbl_graph(nodes = nodes , directed = FALSE) %>%
+  mutate(node_degree = centrality_degree(weights = Weight))
+
+
+# Create graph visualisations
+graph_same %>% activate(nodes) %>%
+  #filter(Degree != 0) %>%
+  activate(edges) %>%
+  mutate(nodes_same_sector2 = case_when( 
+                nodes_same_sector == TRUE ~ "Same sector", 
+                nodes_same_sector == FALSE ~ "Different sector")) %>%
+  ggraph(layout = "linear", circular = TRUE) + 
+    geom_edge_arc(aes(alpha = Weight), colour = "#75cac3") +
+    geom_node_point(aes(colour = node_degree), alpha = 0.8, size = 0.5, show.legend = FALSE) +
+    geom_node_text(aes(filter = node_degree > 6, label = Label), repel = TRUE, colour = "black", size = 3) +
+    coord_fixed() +
+    scale_color_gradient(low = "transparent", high = "black") +
+    labs(title = "Connections between companies in the same sector") +
+    theme_graph()
+
+graph_diff %>% activate(nodes) %>%
+  #filter(Degree != 0) %>%
+  activate(edges) %>%
+  mutate(nodes_same_sector2 = case_when( 
+                nodes_same_sector == TRUE ~ "Same sector", 
+                nodes_same_sector == FALSE ~ "Different sector")) %>%
+  ggraph(layout = "linear", circular = TRUE) + 
+    geom_edge_arc(aes(alpha = Weight), colour = "#eb1e2c") +
+    geom_node_point(aes(colour = node_degree), alpha = 0.8, size = 0.5, show.legend = FALSE) +
+    geom_node_text(aes(filter = node_degree > 13, label = Label), repel = TRUE, colour = "black", size = 3) +
+    coord_fixed() +
+    scale_color_gradient(low = "transparent", high = "black") +
+    labs(title = "Connections between companies in different sectors") +
+    theme_graph()
+```
+
+
+Out of the `r graph %>% activate(edges) %>% as.tibble %>% summarise(edges = sum(Weight)) %>% pull()` connections, `r graph %>% activate(edges) %>% filter(nodes_same_sector == TRUE) %>% as.tibble %>% summarise(edges = sum(Weight)) %>% pull()` connections are found between companies that are active within the same sector, while `r graph %>% activate(edges) %>% filter(nodes_same_sector == FALSE) %>% as.tibble %>% summarise(edges = sum(Weight)) %>% pull()` are found between companies that operate in different sectors. Since the number of possible connections between companies from different sectors are magnitudes larger than the number of possible connections between companies within the same sector, a company is much more likely to have connections to any given company if they operate in the same sector.
+
+## Conclusion
+
+To conclude, most executives and board members are male (have male names) and they usually work for only one company. However, exceptions exists and `r round(100*n_nodes_connected/n_nodes_total, 0)` % of companies are connected to another company through its board members or key executives. In fact `r n_nodes_large_comp` companies are in some way directly or indirectly connected altough the distance between two companies may be large with a diameter of `r diam_graph`. Companies are also much more likely to be connected if they operate within the same sector.
+
+## Future ideas
+As mentioned it would be really fun to do some interactive graphs. This would also make it easier to make clear graphs and visualisations, since the graph we have got is rather busy since it contains a lot of nodes and edges. One could also delve deeper into who these people are that have multiple positions at different companies as well as which (if any) characteristics companies with a connection share.
+
+## References
+
+- For tidygraph and ggraph: 
+    - Blog posts: https://www.data-imaginist.com/ (The personal blog of the package creator)
+    - ggraph: https://rdrr.io/cran/ggraph/
+    - tidygraph: https://rdrr.io/cran/tidygraph/
+- For ggplot and visualisation
+    - Inspiration: https://serialmentor.com/dataviz/
+- For statitics referred to in the text:
+    - SCB: https://www.scb.se/hitta-statistik/sverige-i-siffror/namnsok/
+    - Allbright: http://www.allbright.se/s/Allbrightrapporten-2018_WEBB.pdf
+- For data collection:
+    - Nasdaq: www.nasdaqomxnordic.com/
+    - Reuters: https://www.reuters.com/
+    - OpenPermID: https://permid.org/
+    
+And many more...
